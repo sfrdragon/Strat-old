@@ -427,8 +427,9 @@ namespace FlagshipStrategy
 
                 this.Log($"Historical data loaded: {historicalData.Count} bars", StrategyLoggingLevel.Info);
 
-                // Subscribe to history events - use HistoryItemUpdated for bar processing (like HRVD)
-                this.historicalData.HistoryItemUpdated += OnHistoryItemUpdated;
+                // Subscribe to history events - use NewHistoryItem for bar close processing ONLY
+                // This ensures orders are placed only when a bar closes, not on every tick
+                this.historicalData.NewHistoryItem += OnNewHistoryItem;
 
                 // Initialize volume analysis if we have data
                 if (this.historicalData.Count > 0)
@@ -759,7 +760,7 @@ namespace FlagshipStrategy
             // Historical data events
             if (this.historicalData != null)
             {
-                this.historicalData.HistoryItemUpdated -= OnHistoryItemUpdated;
+                this.historicalData.NewHistoryItem -= OnNewHistoryItem;
             }
 
             // Volume analysis events
@@ -910,9 +911,11 @@ namespace FlagshipStrategy
             }
         }
 
-        private void OnHistoryItemUpdated(object sender, HistoryEventArgs e)
+        private void OnNewHistoryItem(object sender, HistoryEventArgs e)
         {
-            // Process bars from history (following HRVD pattern)
+            // Process ONLY on bar close (NewHistoryItem event)
+            // This ensures all volume delta calculations and order placements
+            // happen only when a bar has fully closed with complete volume data
             if (e?.HistoryItem is HistoryItemBar bar)
             {
                 ProcessNewBar(bar);
@@ -1002,6 +1005,16 @@ namespace FlagshipStrategy
 
         private void OnCandleClose(HistoryItemBar bar)
         {
+            // ═══════════════════════════════════════════════════════════════
+            // CRITICAL: This method is ONLY called when a bar closes
+            // (triggered by NewHistoryItem event, not HistoryItemUpdated)
+            //
+            // This ensures:
+            // 1. All volume delta calculations use complete, finalized data
+            // 2. All orders are placed ONLY on bar close, never mid-bar
+            // 3. Signals are evaluated consistently at bar boundaries
+            // ═══════════════════════════════════════════════════════════════
+
             // Cache signals at candle close for consistent evaluation
             if (this.signalManager != null)
             {
@@ -1982,9 +1995,11 @@ namespace FlagshipStrategy
             if (history.Count < lookbackWindow || currentBar.VolumeAnalysisData == null)
                 return;
 
+            // IMPORTANT: currentBar is the bar that just CLOSED (triggered by NewHistoryItem event)
+            // This ensures we're using complete, finalized volume delta data
             // Get current Volume Delta from VolumeAnalysisData (using Quantower's built-in)
             var volumeData = currentBar.VolumeAnalysisData;
-            currentVD = volumeData.Total.Delta; // BuyVolume - SellVolume
+            currentVD = volumeData.Total.Delta; // BuyVolume - SellVolume for CLOSED bar
 
             // Calculate average VD over lookback window
             averageVD = CalculateAverageVD(history, lookbackWindow);
@@ -2058,10 +2073,11 @@ namespace FlagshipStrategy
             if (history.Count < lookbackWindow || currentBar.VolumeAnalysisData == null)
                 return;
 
-            // Price move = absolute value(open - close)
+            // IMPORTANT: currentBar is the CLOSED bar (triggered by NewHistoryItem event)
+            // Price move = absolute value(open - close) for CLOSED bar
             currentPriceMove = Math.Abs(currentBar.Open - currentBar.Close);
 
-            // VD = absolute value(volume delta)
+            // VD = absolute value(volume delta) for CLOSED bar
             currentVD = Math.Abs(currentBar.VolumeAnalysisData.Total.Delta);
 
             // Current price move to current VD ratio (CPVD) = price move / VD
@@ -2253,7 +2269,8 @@ namespace FlagshipStrategy
             if (history.Count < lookbackWindow || currentBar.VolumeAnalysisData == null)
                 return;
 
-            // VD = absolute value of volume delta
+            // IMPORTANT: currentBar is the CLOSED bar (triggered by NewHistoryItem event)
+            // VD = absolute value of volume delta for CLOSED bar
             double currentVD = Math.Abs(currentBar.VolumeAnalysisData.Total.Delta);
             double currentVolume = currentBar.Volume;
 
