@@ -99,6 +99,12 @@ namespace FlagshipStrategy
         [InputParameter("Max Stop Distance (ticks)", 42, 10, 100, 1, 0)]
         public int MaxStopDistance { get; set; } = 20;
 
+        [InputParameter("Enable Candle-Based Trailing Stop", 43)]
+        public bool EnableCandleTrailingStop { get; set; } = false;
+
+        [InputParameter("Candle Trail Offset (ticks)", 44, 0, 20, 1, 0)]
+        public int CandleTrailOffsetTicks { get; set; } = 0;
+
         #endregion
 
         #region === TAKE PROFIT PARAMETERS ===
@@ -962,9 +968,18 @@ namespace FlagshipStrategy
                     }
                     this.stopLossManager.UpdatePreviousCandle(bar);
 
-                    // Update stop loss orders for all positions
+                    // Update stop loss levels for all positions based on new candle
                     foreach (var position in activePositions)
                     {
+                        // Recalculate stop loss based on new candle high/low
+                        this.stopLossManager.UpdateStopLoss(
+                            position.Id,
+                            bar.Close,
+                            position.Side,
+                            position.AverageOpenPrice
+                        );
+
+                        // Then update the actual stop loss order with the new level
                         if (this.stopLossOrderManager != null)
                         {
                             this.stopLossOrderManager.UpdateStopLossOrder(position.Id);
@@ -1511,6 +1526,8 @@ namespace FlagshipStrategy
                 this.MinStopDistance,
                 this.MaxStopDistance,
                 this.CurrentSymbol.TickSize,
+                this.EnableCandleTrailingStop,
+                this.CandleTrailOffsetTicks,
                 this.sessionManager,
                 (msg, level) => this.Log(msg, level)
             );
@@ -3257,6 +3274,8 @@ namespace FlagshipStrategy
         private readonly int minStopDistanceTicks;
         private readonly int maxStopDistanceTicks;
         private readonly double tickSize;
+        private readonly bool enableCandleTrailingStop;
+        private readonly int candleTrailOffsetTicks;
         private readonly Action<string, StrategyLoggingLevel> logAction;
 
         private Dictionary<string, StopLossInfo> stopLosses;
@@ -3268,6 +3287,8 @@ namespace FlagshipStrategy
             int minStopDistanceTicks,
             int maxStopDistanceTicks,
             double tickSize,
+            bool enableCandleTrailingStop,
+            int candleTrailOffsetTicks,
             SessionManager sessionManager,
             Action<string, StrategyLoggingLevel> logger)
         {
@@ -3275,6 +3296,8 @@ namespace FlagshipStrategy
             this.minStopDistanceTicks = minStopDistanceTicks;
             this.maxStopDistanceTicks = maxStopDistanceTicks;
             this.tickSize = tickSize;
+            this.enableCandleTrailingStop = enableCandleTrailingStop;
+            this.candleTrailOffsetTicks = candleTrailOffsetTicks;
             this.logAction = logger;
 
             this.stopLosses = new Dictionary<string, StopLossInfo>();
@@ -3292,10 +3315,74 @@ namespace FlagshipStrategy
 
         public double CalculateStopLoss(Side side, double currentPrice, double entryPrice)
         {
-            if (previousCandle == null || currentAtr <= 0)
+            if (previousCandle == null)
             {
                 // Use minimum distance as fallback
-                logAction?.Invoke($"No previous candle or ATR data, using min stop distance",
+                logAction?.Invoke($"No previous candle data, using min stop distance",
+                    StrategyLoggingLevel.Info);
+                return side == Side.Buy ?
+                    entryPrice - (minStopDistanceTicks * tickSize) :
+                    entryPrice + (minStopDistanceTicks * tickSize);
+            }
+
+            double stopLoss;
+
+            // ═══════════════════════════════════════════════════════════════
+            // CANDLE-BASED TRAILING STOP MODE
+            // Trails to the most recent candle high/low with optional offset
+            // ═══════════════════════════════════════════════════════════════
+            if (enableCandleTrailingStop)
+            {
+                double offsetDistance = candleTrailOffsetTicks * tickSize;
+
+                if (side == Side.Buy)
+                {
+                    // For long positions: Stop Loss = Most Recent Candle Low - Offset
+                    stopLoss = previousCandle.Low - offsetDistance;
+                    double distance = entryPrice - stopLoss;
+                    double distanceTicks = distance / tickSize;
+
+                    logAction?.Invoke($"[CANDLE TRAIL] Buy SL: Candle Low={previousCandle.Low:F2}, " +
+                        $"Offset={candleTrailOffsetTicks} ticks, SL={stopLoss:F2}, Distance={distanceTicks:F0} ticks",
+                        StrategyLoggingLevel.Info);
+
+                    // Apply min distance constraint (prevent stop too close)
+                    if (distanceTicks < minStopDistanceTicks)
+                    {
+                        stopLoss = entryPrice - (minStopDistanceTicks * tickSize);
+                        logAction?.Invoke($"SL adjusted to min distance: {stopLoss:F2}", StrategyLoggingLevel.Info);
+                    }
+                }
+                else
+                {
+                    // For short positions: Stop Loss = Most Recent Candle High + Offset
+                    stopLoss = previousCandle.High + offsetDistance;
+                    double distance = stopLoss - entryPrice;
+                    double distanceTicks = distance / tickSize;
+
+                    logAction?.Invoke($"[CANDLE TRAIL] Sell SL: Candle High={previousCandle.High:F2}, " +
+                        $"Offset={candleTrailOffsetTicks} ticks, SL={stopLoss:F2}, Distance={distanceTicks:F0} ticks",
+                        StrategyLoggingLevel.Info);
+
+                    // Apply min distance constraint (prevent stop too close)
+                    if (distanceTicks < minStopDistanceTicks)
+                    {
+                        stopLoss = entryPrice + (minStopDistanceTicks * tickSize);
+                        logAction?.Invoke($"SL adjusted to min distance: {stopLoss:F2}", StrategyLoggingLevel.Info);
+                    }
+                }
+
+                return stopLoss;
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // ATR-BASED TRAILING STOP MODE (Original behavior)
+            // Uses previous candle high/low with ATR multiplier offset
+            // ═══════════════════════════════════════════════════════════════
+            if (currentAtr <= 0)
+            {
+                // Use minimum distance as fallback
+                logAction?.Invoke($"No ATR data, using min stop distance",
                     StrategyLoggingLevel.Info);
                 return side == Side.Buy ?
                     entryPrice - (minStopDistanceTicks * tickSize) :
@@ -3303,7 +3390,6 @@ namespace FlagshipStrategy
             }
 
             double atrDistance = currentAtr * atrMultiplier;
-            double stopLoss;
 
             if (side == Side.Buy)
             {
